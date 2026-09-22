@@ -7,9 +7,6 @@
 <meta name="description" content="AVALON 圆桌召集令">
 <title>AVALON · 圆桌召集令</title>
 
-<!-- CloudBase Web SDK：填好环境 ID 后自动启用多人实时 RSVP -->
-<script src="https://static.cloudbase.net/cloudbase-js-sdk/latest/cloudbase.full.js"></script>
-
 <style>
 :root {
   --bg:#090c11; --panel:#10151c; --text:#f2efe7; --muted:#99a2ad;
@@ -157,25 +154,13 @@ input:focus{border-color:rgba(199,166,101,.65)}
 
 <script>
 /* ============================================================
-   你真正上线前只需要改这里：
-   1) 在 CloudBase 创建环境
-   2) 把环境 ID 粘贴到下面
-   3) 创建集合 avalon_rsvp，权限设为 READONLY
-      （所有人可读，仅创建者和管理员可写）
+   EdgeOne Makers 版本
+   前端通过同域 /api/rsvp 调用 Node Function
+   后端使用 EdgeOne Blob 保存多人 RSVP
    ============================================================ */
-const CLOUDBASE_ENV_ID = "avalonroom-d7gf6guus24902788";
-const CLOUDBASE_REGION = "ap-shanghai";
-const EVENT_ID = "avalon-2026-09-26";
 
-const cloudConfigured =
-  CLOUDBASE_ENV_ID &&
-  !CLOUDBASE_ENV_ID.includes("REPLACE_WITH");
-
-let db = null;
-let auth = null;
-let uid = null;
-let watcher = null;
-let currentRecords = [];
+const API_URL = "/api/rsvp";
+const POLL_MS = 5000;
 
 const modal = document.getElementById("modal");
 const nickname = document.getElementById("nickname");
@@ -184,38 +169,70 @@ const notice = document.getElementById("notice");
 const cloudDot = document.getElementById("cloudDot");
 const cloudText = document.getElementById("cloudText");
 const confirmBtn = document.getElementById("confirmBtn");
+
 let pendingResponse = null;
+let pollTimer = null;
 
 const copy = {
-  join:{title:"接受召唤",desc:"留下昵称，圆桌将为你保留一个位置。",result:n=>`<strong>⚔ 契约成立</strong><br>${esc(n)} 已接受召唤。<br>至于你究竟效忠谁……开局后才知道。`},
-  maybe:{title:"暂时观望",desc:"留下昵称，之后仍然可以改变决定。",result:n=>`<strong>◐ 命运尚未决定</strong><br>${esc(n)} 目前选择观望。<br>在圆桌集结前，你仍可改变决定。`},
-  no:{title:"本局暂别",desc:"留下昵称，方便组织者知道这次不用等你。",result:n=>`<strong>🕊 这局先鸽</strong><br>${esc(n)} 本次无法赴约。<br>圆桌会记住这一次。`}
+  join:{
+    title:"接受召唤",
+    desc:"留下昵称，圆桌将为你保留一个位置。",
+    result:n=>`<strong>⚔ 契约成立</strong><br>${esc(n)} 已接受召唤。<br>至于你究竟效忠谁……开局后才知道。`
+  },
+  maybe:{
+    title:"暂时观望",
+    desc:"留下昵称，之后仍然可以改变决定。",
+    result:n=>`<strong>◐ 命运尚未决定</strong><br>${esc(n)} 目前选择观望。<br>在圆桌集结前，你仍可改变决定。`
+  },
+  no:{
+    title:"本局暂别",
+    desc:"留下昵称，方便组织者知道这次不用等你。",
+    result:n=>`<strong>🕊 这局先鸽</strong><br>${esc(n)} 本次无法赴约。<br>圆桌会记住这一次。`
+  }
 };
 
 function esc(s){
-  return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
+  return String(s ?? "").replace(/[&<>"']/g, c=>({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"
+  }[c]));
 }
+
 function setCloudState(mode,text){
-  cloudDot.className="dot "+mode;
-  cloudText.textContent=text;
+  cloudDot.className = "dot " + mode;
+  cloudText.textContent = text;
 }
+
 function showNotice(text){
-  notice.textContent=text; notice.style.display="block";
+  notice.textContent = text;
+  notice.style.display = "block";
 }
+
+function hideNotice(){
+  notice.style.display = "none";
+}
+
 function openModal(response){
-  pendingResponse=response;
-  nickname.value=localStorage.getItem("avalon_name")||"";
-  document.getElementById("modalTitle").textContent=copy[response].title;
-  document.getElementById("modalDesc").textContent=copy[response].desc;
+  pendingResponse = response;
+  nickname.value = localStorage.getItem("avalon_name") || "";
+  document.getElementById("modalTitle").textContent = copy[response].title;
+  document.getElementById("modalDesc").textContent = copy[response].desc;
   modal.classList.add("show");
   setTimeout(()=>nickname.focus(),100);
 }
-function closeModal(){modal.classList.remove("show");pendingResponse=null}
-function renderMyStatus(response,name){
-  if(!response||!name||!copy[response]) return;
-  statusBox.innerHTML=copy[response].result(name)+'<div class="change">再次点击任一按钮即可修改选择。</div>';
-  statusBox.style.display="block";
+
+function closeModal(){
+  modal.classList.remove("show");
+  pendingResponse = null;
 }
+
+function renderMyStatus(response,name){
+  if(!response || !name || !copy[response]) return;
+  statusBox.innerHTML =
+    copy[response].result(name) +
+    '<div class="change">再次点击任一按钮即可修改选择。</div>';
+  statusBox.style.display = "block";
+}
+
 function groupRecords(records){
   return {
     join:records.filter(x=>x.response==="join"),
@@ -223,143 +240,187 @@ function groupRecords(records){
     no:records.filter(x=>x.response==="no")
   };
 }
-function renderStats(records){
-  currentRecords=records||[];
-  const g=groupRecords(currentRecords);
-  document.getElementById("joinCount").textContent=g.join.length;
-  document.getElementById("maybeCount").textContent=g.maybe.length;
-  document.getElementById("noCount").textContent=g.no.length;
 
-  const labels={join:"接受召唤",maybe:"仍在观望",no:"这局先鸽"};
-  const host=document.getElementById("people");
-  host.innerHTML=["join","maybe","no"].map(k=>{
-    const chips=g[k].length
-      ? g[k].map(r=>`<span class="chip">${esc(r.nickname||"未署名")}</span>`).join("")
+function renderStats(records){
+  const g = groupRecords(records || []);
+  document.getElementById("joinCount").textContent = g.join.length;
+  document.getElementById("maybeCount").textContent = g.maybe.length;
+  document.getElementById("noCount").textContent = g.no.length;
+
+  const labels = {
+    join:"接受召唤",
+    maybe:"仍在观望",
+    no:"这局先鸽"
+  };
+
+  const host = document.getElementById("people");
+  host.innerHTML = ["join","maybe","no"].map(k=>{
+    const chips = g[k].length
+      ? g[k].map(r=>`<span class="chip">${esc(r.nickname || "未署名")}</span>`).join("")
       : '<span class="empty">暂无</span>';
-    return `<div class="group"><div class="group-label">${labels[k]}</div><div class="chips">${chips}</div></div>`;
+
+    return `
+      <div class="group">
+        <div class="group-label">${labels[k]}</div>
+        <div class="chips">${chips}</div>
+      </div>
+    `;
   }).join("");
 }
-function renderLocalDemo(){
-  const r=localStorage.getItem("avalon_rsvp");
-  const n=localStorage.getItem("avalon_name");
-  const records=r&&n?[{response:r,nickname:n}]:[];
-  renderStats(records);
-  if(r&&n) renderMyStatus(r,n);
-}
-async function initCloud(){
-  if(!cloudConfigured){
-    setCloudState("demo","本机试玩");
-    showNotice("现在是本机试玩模式。部署前填入 CloudBase 环境 ID，就会自动切换成多人实时统计。");
-    renderLocalDemo();
-    return;
+
+function getClientId(){
+  let id = localStorage.getItem("avalon_client_id");
+  if(!id){
+    if(window.crypto && crypto.randomUUID){
+      id = crypto.randomUUID().replace(/-/g,"");
+    }else{
+      id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    }
+    localStorage.setItem("avalon_client_id", id);
   }
+  return id;
+}
+
+async function loadRSVP(){
   try{
-    const app=cloudbase.init({env:CLOUDBASE_ENV_ID,region:CLOUDBASE_REGION});
-    auth=app.auth();
-    await auth.signInAnonymously();
-    const user=await auth.getUserInfo();
-    uid=user.uid;
-    db=app.database();
-    setCloudState("live","多人实时");
-    await loadMyCloudRecord();
-    startRealtime();
-  }catch(err){
-    console.error(err);
-    setCloudState("demo","云端连接失败");
-    showNotice("云端暂时连接失败，已自动切换到本机模式。请检查环境 ID、匿名登录和数据库权限。");
-    renderLocalDemo();
-  }
-}
-async function loadMyCloudRecord(){
-  const res=await db.collection("avalon_rsvp")
-    .where({event_id:EVENT_ID,_openid:uid})
-    .limit(1).get();
-  const mine=(res.data||[])[0];
-  if(mine){
-    localStorage.setItem("avalon_name",mine.nickname||"");
-    localStorage.setItem("avalon_rsvp",mine.response||"");
-    renderMyStatus(mine.response,mine.nickname);
-  }
-}
-function startRealtime(){
-  if(watcher) watcher.close();
-  watcher=db.collection("avalon_rsvp")
-    .where({event_id:EVENT_ID})
-    .watch({
-      onChange:snapshot=>{
-        renderStats(snapshot.docs||[]);
-        setCloudState("live","多人实时");
-      },
-      onError:err=>{
-        console.error(err);
-        setCloudState("demo","实时连接中断");
-        refreshOnce();
-      }
+    const res = await fetch(API_URL, {
+      method:"GET",
+      cache:"no-store",
+      headers:{"Accept":"application/json"}
     });
+
+    if(!res.ok){
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    if(!data.ok){
+      throw new Error(data.error || "load failed");
+    }
+
+    renderStats(data.records || []);
+    setCloudState("live","圆桌已连接");
+    hideNotice();
+    return data.records || [];
+  }catch(err){
+    console.error("RSVP load error:", err);
+    setCloudState("demo","连接失败");
+    showNotice("报名服务暂时连接失败，请稍后刷新页面再试。");
+    return [];
+  }
 }
-async function refreshOnce(){
-  try{
-    const res=await db.collection("avalon_rsvp").where({event_id:EVENT_ID}).get();
-    renderStats(res.data||[]);
-  }catch(e){console.error(e)}
-}
-async function saveCloud(response,name){
-  const col=db.collection("avalon_rsvp");
-  const mine=await col.where({event_id:EVENT_ID,_openid:uid}).limit(1).get();
-  const payload={
-    event_id:EVENT_ID,
+
+async function saveRSVP(response,name){
+  const payload = {
+    client_id:getClientId(),
     nickname:name,
-    response:response,
-    updated_at:new Date().toISOString()
+    response
   };
-  if((mine.data||[]).length){
-    await col.doc(mine.data[0]._id).update(payload);
-  }else{
-    payload.created_at=new Date().toISOString();
-    await col.add(payload);
+
+  const res = await fetch(API_URL, {
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "Accept":"application/json"
+    },
+    body:JSON.stringify(payload)
+  });
+
+  if(!res.ok){
+    let message = `HTTP ${res.status}`;
+    try{
+      const data = await res.json();
+      message = data.error || message;
+    }catch{}
+    throw new Error(message);
   }
-}
-async function saveResponse(response,name){
-  localStorage.setItem("avalon_name",name);
-  localStorage.setItem("avalon_rsvp",response);
-  if(cloudConfigured && db && uid){
-    await saveCloud(response,name);
-  }else{
-    renderLocalDemo();
+
+  const data = await res.json();
+  if(!data.ok){
+    throw new Error(data.error || "save failed");
   }
+
+  localStorage.setItem("avalon_name", name);
+  localStorage.setItem("avalon_rsvp", response);
+
   renderMyStatus(response,name);
+  await loadRSVP();
+
+  return data.record;
 }
+
+function restoreLocalStatus(){
+  const r = localStorage.getItem("avalon_rsvp");
+  const n = localStorage.getItem("avalon_name");
+  if(r && n){
+    renderMyStatus(r,n);
+  }
+}
+
 document.querySelectorAll("[data-response]").forEach(btn=>{
   btn.addEventListener("click",()=>openModal(btn.dataset.response));
 });
+
 document.getElementById("cancelBtn").addEventListener("click",closeModal);
-modal.addEventListener("click",e=>{if(e.target===modal)closeModal()});
+
+modal.addEventListener("click",e=>{
+  if(e.target===modal) closeModal();
+});
+
 confirmBtn.addEventListener("click",async()=>{
-  const name=nickname.value.trim();
-  if(!name){nickname.focus();nickname.style.borderColor="#a94c4c";return}
+  const name = nickname.value.trim();
+
+  if(!name){
+    nickname.focus();
+    nickname.style.borderColor="#a94c4c";
+    return;
+  }
+
   nickname.style.borderColor="";
-  confirmBtn.classList.add("saving");confirmBtn.textContent="保存中…";
+  confirmBtn.classList.add("saving");
+  confirmBtn.textContent="保存中…";
+
   try{
-    await saveResponse(pendingResponse,name);
+    await saveRSVP(pendingResponse,name);
     closeModal();
-    setTimeout(()=>statusBox.scrollIntoView({behavior:"smooth",block:"center"}),120);
+    setTimeout(()=>{
+      statusBox.scrollIntoView({behavior:"smooth",block:"center"});
+    },120);
   }catch(err){
-    console.error(err);
-    alert("保存失败，请再试一次。若一直失败，请检查 CloudBase 数据库权限。");
+    console.error("RSVP save error:", err);
+    alert("保存失败，请稍后再试。");
   }finally{
-    confirmBtn.classList.remove("saving");confirmBtn.textContent="确认";
+    confirmBtn.classList.remove("saving");
+    confirmBtn.textContent="确认";
   }
 });
-nickname.addEventListener("keydown",e=>{if(e.key==="Enter")confirmBtn.click()});
-document.getElementById("listToggle").addEventListener("click",e=>{
-  const p=document.getElementById("people");
-  const show=!p.classList.contains("show");
-  p.classList.toggle("show",show);
-  e.currentTarget.textContent=show?"收起响应名单 ▴":"查看响应名单 ▾";
-});
-window.addEventListener("beforeunload",()=>{if(watcher)watcher.close()});
 
-initCloud();
+nickname.addEventListener("keydown",e=>{
+  if(e.key==="Enter") confirmBtn.click();
+});
+
+document.getElementById("listToggle").addEventListener("click",e=>{
+  const p = document.getElementById("people");
+  const show = !p.classList.contains("show");
+  p.classList.toggle("show",show);
+  e.currentTarget.textContent = show
+    ? "收起响应名单 ▴"
+    : "查看响应名单 ▾";
+});
+
+async function start(){
+  restoreLocalStatus();
+  await loadRSVP();
+
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(loadRSVP,POLL_MS);
+}
+
+window.addEventListener("beforeunload",()=>{
+  if(pollTimer) clearInterval(pollTimer);
+});
+
+start();
 </script>
 </body>
 </html>
